@@ -12,7 +12,7 @@ import threading
 import asyncio
 
 # -------------------- APP CONFIG --------------------
-app = Flask("traductionimpact", static_folder="static")
+app = Flask("traductionimpact3", static_folder="static")
 CORS(app)
 load_dotenv()
 
@@ -287,3 +287,4 @@ with open("live_vertaal.html", "a", encoding="utf-8") as f:
 # -------------------- START SERVER --------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
