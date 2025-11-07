@@ -1,0 +1,11 @@
+<!-- index.html (enkel als redirect nodig is) -->
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta http-equiv="refresh" content="0; URL='index.html'" />
+    <title>Redirecting…</title>
+  </head>
+  <body>
+    <p>Redirecting to <a href="index.html">index.html</a></p>
+  </body>
+</html>
