@@ -2,8 +2,9 @@ openai
 deepl
 python-dotenv
 flask
+flask-cors
 requests
-flask
-flask_cors
 edge-tts
 pygame
+
+
