@@ -1,0 +1,7 @@
+Flask
+openai
+deepl
+python-dotenv
+flask
+requests
+
