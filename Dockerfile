@@ -14,5 +14,7 @@ COPY . .
 # Poort instellen
 EXPOSE 8080
 
-# Startcommando (pas aan als je FastAPI gebruikt)
-CMD ["python", "app.py"]
+# Start je app
+CMD ["python", "App.py"]
+
+
