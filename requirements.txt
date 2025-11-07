@@ -1,7 +1,9 @@
-Flask
 openai
 deepl
 python-dotenv
 flask
 requests
-
+flask
+flask_cors
+edge-tts
+pygame
