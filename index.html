@@ -141,7 +141,7 @@
           formData.append("textOnly", document.getElementById("textOnly").checked ? "true" : "false");
 
           try {
-            const response = await fetch("/api/translate", { method: "POST", body: formData });
+            const response = await fetch("https://kaatcaibxl.github.io/traductionimpact/api/translate", { method: "POST", body: formData });
             const data = await response.json();
             document.getElementById("orig").innerText = data.original || "(geen tekst)";
             document.getElementById("trans").innerText = data.translation || "(geen vertaling)";
@@ -206,6 +206,7 @@
   </script>
 </body>
 </html>
+
 
 
 
