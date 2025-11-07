@@ -1,20 +1,23 @@
-# Gebruik een lichte Python-image
-FROM python:3.11-slim
+# Gebruik stabiele Python-versie
+FROM python:3.12-slim
 
-# Werkmap instellen
 WORKDIR /app
 
-# Vereisten installeren
+# Installeer systeemvereisten
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+
+# Installeer Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App-bestanden kopiëren
+# Kopieer projectbestanden
 COPY . .
 
-# Poort instellen
 EXPOSE 8080
 
-# Start je app
-CMD ["python", "App.py"]
+ENTRYPOINT ["python", "App.py"]
+
+
+
 
 
