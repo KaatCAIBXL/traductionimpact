@@ -1,17 +1,20 @@
-from flask import Flask, request, jsonify, send_from_directory
-import tempfile, os
+
+from flask_cors import CORS
+from flask import Flask, request, jsonify, send_from_directory, send_file, after_this_request
+import tempfile, os, threading, asyncio, textwrap
 from openai import OpenAI
 import deepl
 from flask_cors import CORS
-import speech_recognition as sr
-import pygame
-import edge_tts
 from dotenv import load_dotenv
 from datetime import datetime
-import threading
-import asyncio
+from pydub import AudioSegment, silence
+from pydub.effects import normalize, low_pass_filter
+import edge_tts
+from pydub import AudioSegment
 
-# -------------------- APP CONFIG --------------------
+
+
+# --------------------------------this is for an app configuration and the needed apikeys
 app = Flask("traductionimpact3", static_folder="static")
 CORS(app)
 load_dotenv()
@@ -22,34 +25,35 @@ DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 deepl_translator = deepl.Translator(DEEPL_API_KEY)
 
-ENKEL_TEKST_MODUS = False  # False = met stem, True = enkel tekst
-vorige_zinnen = []  # wordt gebruikt voor contextuele correctie
+vorige_zinnen = []
+context_zinnen = []
+
+ENKEL_TEKST_MODUS = False
 
 
-# -------------------- ROUTES --------------------
+# ---------------------------------------------------------------------home page
 @app.route("/")
-def home():
-    return send_from_directory("static", "index.html")
+def index():
+    return send_from_directory(app.static_folder, "index.html")
 
-
-# -------------------- CONTEXTUELE CORRECTIE --------------------
+#--------------------------------------------------------------------corrected sentences
 def corrigeer_zin_met_context(nieuwe_zin, vorige_zinnen):
-    """Corrigeert de nieuwe zin op basis van de laatste drie zinnen (context)."""
     if not nieuwe_zin.strip():
         return nieuwe_zin
 
     context = " ".join(vorige_zinnen[-3:])
+    try:
+        with open("instructies_correctie.txt", "r", encoding="utf-8") as f:
+            instructies_correctie = f.read()
+    except FileNotFoundError:
+        instructies_correctie = "(Geen instructies gevonden.)"
 
-    with open("instructies_correctie.txt", "r", encoding="utf-8") as f:
-        woordenlijst = f.read()
     prompt = f"""
-    Je bent een taalassistent die controleert of een nieuwe zin logisch is binnen een context.
+    Opdracht 1: bekijk alle vorige zinnen door de context te lezen. Ga dan na of er een woord is in de nieuwe zin die niet in de context past. 
+    Opdracht 2: Als je een bijbeltekst herkent uit een erkende bijbelvertaling, zorg dat die klopt.
+    Opdracht 3: Als je merkt dat er gebed is, kijk dan naar {instructies_correctie}.
     Context: "{context}"
     Nieuwe zin: "{nieuwe_zin}"
-    If you detect a Bible-vers, a prayer or something like 'pap' or 'bab' look at this file for instructions. 
-    {instructies_correctie}
-
-    Gebruik dezelfde taal als de originele zin en behoud de natuurlijke stijl.
     Geef enkel de verbeterde zin terug, zonder uitleg.
     """
 
@@ -59,89 +63,149 @@ def corrigeer_zin_met_context(nieuwe_zin, vorige_zinnen):
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
         )
-        verbeterd = response.choices[0].message.content.strip()
-        return verbeterd
+        return response.choices[0].message.content.strip()
     except Exception as e:
         print(f"[!] Fout bij contextuele correctie: {e}")
         return nieuwe_zin
 
 
-# -------------------- STEMFUNCTIE --------------------
-def spreek_tekst_synchroon(tekst, taalcode, spreek_uit=True):
-    """Leest de tekst voor als 'spreek_uit' True is, anders enkel tekst."""
-    if not spreek_uit:
-        return
+#-------------------------------------------------------------------------correcting with whisper
+@app.route("/api/transcribe", methods=["POST"])
+def transcribe_audio():
+    if "audio" not in request.files:
+        return jsonify({"error": "Geen audiobestand ontvangen"}), 400
+
+    audio_file = request.files["audio"]
+    taalcode = request.form.get("lang", "fr")
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            audio_file.save(tmp.name)
+            audio_path = tmp.name
+
+        sound = AudioSegment.from_file(audio_path)
+        sound = normalize(sound)
+        sound = low_pass_filter(sound, cutoff=3000)
+        trimmed = silence.strip_silence(sound, silence_thresh=-40)
+        trimmed.export(audio_path, format="wav")
+
+        with open(audio_path, "rb") as af:
+            transcript_response = openai_client.audio.transcriptions.create(
+                model="whisper-1", file=af, language=taalcode
+            )
+
+        tekst = transcript_response.text.strip()
+        corrected = corrigeer_zin_met_context(tekst, context_zinnen)
+        context_zinnen.append(corrected)
+
+        return jsonify({"original": tekst, "corrected": corrected})
+
+    except Exception as e:
+        return jsonify({"error": f"Fout bij transcriptie: {str(e)}"}), 500
+    finally:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+
+#-------------------------------------------------------------text -> speech
+# 🔊 TTS via edge_tts
+@app.route("/api/speak", methods=["POST"])
+def spreek():
+    tekst = request.form.get("text")
+    taalcode = request.form.get("lang", "nl")
+    spreek_uit = request.form.get("speak", "true") == "true"
+
+    if not spreek_uit or not tekst:
+        return jsonify({"error": "Geen tekst om uit te spreken"}), 400
 
     stemmap = {
-        "nl": "nl-NL-MaartenNeural",
+        "nl": "nl-NL-ColetteNeural",
         "fr": "fr-FR-DeniseNeural",
-        "PT-BR": "pt-BR-AntonioNeural",
-        "ZH-HANS": "zh-CN-XiaoxiaoNeural",
-        "es": "es-ES-AlvaroNeural",
-        "ln": "sw-KE-ZuriNeural",
-        "ar": "ar-EG-SalmaNeural",
-        "hi": "hi-IN-MadhurNeural",
-        "sv": "sv-SE-MattiasNeural",
+        "en": "en-US-AriaNeural",
+        "de": "de-DE-KatjaNeural",
+        "es": "es-ES-ElviraNeural",
+        "pt": "pt-BR-FranciscaNeural",
         "fi": "fi-FI-SelmaNeural",
+        "sv": "sv-SE-SofieNeural",
+        "no": "nb-NO-PernilleNeural",
+        "pl": "pl-PL-AgnieszkaNeural",
+        "ru": "ru-RU-SvetlanaNeural",
+        "tr": "tr-TR-EmelNeural",
+        "ja": "ja-JP-NanamiNeural",
+        "zh": "zh-CN-XiaoxiaoNeural",
+        "ar": "ar-EG-SalmaNeural",
+        "hi": "hi-IN-SwaraNeural",
+        "id": "id-ID-GadisNeural",
+        "ms": "ms-MY-YasminNeural",
         "sw": "sw-KE-ZuriNeural",
-        "mg": "pt-BR-AntonioNeural",
-        "EN-US": "en-CA-ClaraNeural",
+        "am": "am-ET-MekdesNeural",
+        "lingala": "sw-KE-ZuriNeural",  # vervangstem
+        "tshiluba": "sw-KE-ZuriNeural",  # vervangstem
+        "baloué": "sw-KE-ZuriNeural",  # vervansgtem
+        "kikongo": "sw-KE-ZuriNeural",  # vervansgtem
+        "malagasy": "sw-KE-ZuriNeural",  # vervansgtem
+        "dioula": "sw-KE-ZuriNeural",  # vervansgtem
     }
 
-    stem = stemmap.get(taalcode, "en-US-AriaNeural")
+    stem = stemmap.get(taalcode.lower(), "en-US-AriaNeural")
     mp3_bestand = "tts_audio.mp3"
 
-    async def async_save_and_play():
-        communicate = edge_tts.Communicate(tekst, stem)
-        await communicate.save(mp3_bestand)
+    try:
+        asyncio.run(edge_tts.Communicate(tekst, stem).save(mp3_bestand))
 
-        pygame.mixer.init()
-        pygame.mixer.music.load(mp3_bestand)
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy():
-            pygame.time.Clock().tick(10)
-        pygame.mixer.quit()
-        os.remove(mp3_bestand)
+        @after_this_request
+        def remove_file(response):
+            try:
+                os.remove(mp3_bestand)
+            except Exception as e:
+                print(f"[!] Kon bestand niet verwijderen: {e}")
+            return response
 
-    asyncio.run(async_save_and_play())
+        return send_file(mp3_bestand, mimetype="audio/mpeg")
 
+    except Exception as e:
+        return jsonify({"error": f"Fout bij stemgeneratie: {str(e)}"}), 500
 
-# -------------------- DEEPL HELPER --------------------
+# 🔁 DeepL taalcode mapping
 def map_vertaling_taalcode_deepl(taalcode):
-    """Past taalcodes aan naar het formaat dat DeepL vereist."""
-    if taalcode.lower() == "en-us":
+    code = taalcode.lower()
+    if code in ["en", "en-us"]:
         return "EN-US"
-    elif taalcode.lower() == "pt-br":
+    elif code in ["pt", "pt-br"]:
         return "PT-BR"
-    elif taalcode.lower() == "zh-hans":
+    elif code in ["zh", "zh-cn", "zh-hans"]:
         return "ZH"
     else:
-        return taalcode.upper()
+        return code.upper()
+
+#----------------------------------------------------audiobestand omvormen
+from pydub import AudioSegment
+
+def convert_to_wav(input_path):
+    sound = AudioSegment.from_file(input_path)
+    wav_path = input_path.replace(".webm", ".wav")
+    sound.export(wav_path, format="wav")
+    return wav_path
 
 
-# -------------------- HOOFDROUTE: LIVE AUDIO --------------------
+# -------------------- HOOFDROUTE --------------------
 @app.route("/api/translate", methods=["POST"])
-
 def vertaal_audio():
-    """Hoofdfunctie: ontvangt audio, transcribeert, corrigeert, vertaalt, spreekt uit."""
     global vorige_zinnen
 
     if "audio" not in request.files:
         return jsonify({"error": "Geen audio ontvangen"}), 400
 
     audio_file = request.files["audio"]
-    bron_taal = request.form.get("from", "fr")
-    doel_taal = request.form.get("to", "nl")
+    bron_taal = request.form.get("from", "fr").lower()
+    doel_taal = request.form.get("to", "nl").lower()
     enkel_tekst = request.form.get("textOnly", "false") == "true"
 
-    # tijdelijke opslag
-    ext = os.path.splitext(audio_file.filename)[1] or ".wav"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         audio_file.save(tmp.name)
-        audio_path = tmp.name
+        audio_path = convert_to_wav(audio_path)
 
     try:
-        # 🎧 Stap 1: Transcriberen via Whisper
+        # 🎧 Transcriptie via Whisper
         with open(audio_path, "rb") as af:
             transcript_response = openai_client.audio.transcriptions.create(
                 model="whisper-1", file=af, language=bron_taal
@@ -150,122 +214,65 @@ def vertaal_audio():
         if not tekst:
             return jsonify({"error": "Geen spraak gedetecteerd."}), 400
 
-        # ✍️ Stap 2: Contextuele correctie
+        # ✍️ Contextuele correctie
         verbeterde_zin = corrigeer_zin_met_context(tekst, vorige_zinnen)
         vorige_zinnen.append(verbeterde_zin)
 
-        # 🌍 Stap 3: Vertalen
-        if doel_taal == 'lua':
-            with open("instructies_Tshiluba.txt", "r", encoding="utf-8") as f:
-                Tshiluba = f.read()
-            messages = [
-                {"role": "system",
-                 "content": f"""
-                 You are a translator. Translate from {bron_taal} to Tshiluba. If unsure look at the following file
-                 {Tshiluba} if you still dont know a word,use a similar with the same meaning or at least close, otherwise use a French fallback.
-                               """},
-                {"role": "user", "content": verbeterde_zin},
-            ]
-            chat_response = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo", messages=messages, temperature=0.7
+        # 🌍 Vertaling
+        deepl_supported = {
+            "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hu", "id",
+            "it", "ja", "ko", "lt", "lv", "nb", "nl", "pl", "pt", "ro", "ru", "sk",
+            "sl", "sv", "tr", "uk", "zh"
+        }
+
+        if doel_taal in deepl_supported:
+            try:
+                doel_taal_code = map_vertaling_taalcode_deepl(doel_taal)
+                result = deepl_translator.translate_text(
+                    verbeterde_zin, source_lang=bron_taal, target_lang=doel_taal_code
+                )
+                vertaling = result.text
+            except Exception:
+                vertaling = verbeterde_zin  # fallback bij DeepL-fout
+
+        elif doel_taal == "tshiluba":
+            try:
+                with open("instructies_Tshiluba.txt", "r", encoding="utf-8") as f:
+                    insTsh = f.read()
+            except FileNotFoundError:
+                insTsh = "(Geen instructies gevonden.)"
+
+            prompt = textwrap.dedent(f"""
+                Vertaal deze zin van {bron_taal} naar Tshiluba: {verbeterde_zin}
+                MAAR als er een woord is dat je niet kent, kijk dan naar deze lijst: {insTsh}
+                Als je het woord nog steeds niet kent, kies een gelijkaardig woord met vergelijkbare betekenis.
+                Als dat ook niet lukt, vertaal dan naar het Frans als fallback.
+            """)
+
+            response = openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
             )
-            vertaling = chat_response.choices[0].message.content.strip()
-            # 📝 Stap 4: Wegschrijven naar live_vertaal.html
-            for zin in live_input_stream:
-                verbeterde_zin = verbeter(zin)
-                vertaling = vertaal(verbeterde_zin)
-                tijd = datetime.now().strftime("%H:%M:%S")
-                bron_taal = detecteer_bron_taal(zin)
-                doel_taal = gekozen_doeltaal
-
-                with open("live_vertaal.html", "a", encoding="utf-8") as f:
-                    f.write(f"""
-                                <div class="fragment">
-                                  <div class="tijd">⏱️ {tijd}</div>
-                                  <div class="origineel">
-                                    <span class="label">Origineel ({bron_taal}):</span>
-                                    <span class="zin">{verbeterde_zin}</span>
-                                  </div>
-                                  <div class="vertaling">
-                                    <span class="label">Vertaling ({doel_taal}):</span>
-                                    <span class="zin">{vertaling}</span>
-                                  </div>
-                                </div>
-                                """)
-
-        talen_zonder_deepl_support = ["kg", "dyu", "bci", "ln", "am", "mg", "sw"]
-        if doel_taal in talen_zonder_deepl_support:
-            messages = [
-                {"role": "system",
-                 "content": f"You are a translator. Translate from {bron_taal} to {doel_taal}. If unsure, use a French fallback."},
-                {"role": "user", "content": verbeterde_zin},
-            ]
-            chat_response = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo", messages=messages, temperature=0.7
-            )
-            vertaling = chat_response.choices[0].message.content.strip()
-
-            # 📝 Stap 4: Wegschrijven naar live_vertaal.html
-            for zin in live_input_stream:
-                verbeterde_zin = verbeter(zin)
-                vertaling = vertaal(verbeterde_zin)
-                tijd = datetime.now().strftime("%H:%M:%S")
-                bron_taal = detecteer_bron_taal(zin)
-                doel_taal = gekozen_doeltaal
-
-                with open("live_vertaal.html", "a", encoding="utf-8") as f:
-                    f.write(f"""
-                                    <div class="fragment">
-                                      <div class="tijd">⏱️ {tijd}</div>
-                                      <div class="origineel">
-                                        <span class="label">Origineel ({bron_taal}):</span>
-                                        <span class="zin">{verbeterde_zin}</span>
-                                      </div>
-                                      <div class="vertaling">
-                                        <span class="label">Vertaling ({doel_taal}):</span>
-                                        <span class="zin">{vertaling}</span>
-                                      </div>
-                                    </div>
-                                    """)
+            vertaling = response.choices[0].message.content.strip()
 
         else:
-            doel_taal_code = map_vertaling_taalcode_deepl(doel_taal)
-            result = deepl_translator.translate_text(
-                verbeterde_zin, source_lang=bron_taal, target_lang=doel_taal_code
+            # Fallback naar GPT voor andere niet-DeepL talen
+            prompt = f"Vertaal deze zin van {bron_taal} naar {doel_taal}: {verbeterde_zin}"
+            response = openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
             )
-            vertaling = result.text
-            # 📝 Stap 4: Wegschrijven naar live_vertaal.html
-            for zin in live_input_stream:
-                verbeterde_zin = verbeter(zin)
-                vertaling = vertaal(verbeterde_zin)
-                tijd = datetime.now().strftime("%H:%M:%S")
-                bron_taal = detecteer_bron_taal(zin)
-                doel_taal = gekozen_doeltaal
+            vertaling = response.choices[0].message.content.strip()
 
-                with open("live_vertaal.html", "a", encoding="utf-8") as f:
-                    f.write(f"""
-                                    <div class="fragment">
-                                      <div class="tijd">⏱️ {tijd}</div>
-                                      <div class="origineel">
-                                        <span class="label">Origineel ({bron_taal}):</span>
-                                        <span class="zin">{verbeterde_zin}</span>
-                                      </div>
-                                      <div class="vertaling">
-                                        <span class="label">Vertaling ({doel_taal}):</span>
-                                        <span class="zin">{vertaling}</span>
-                                      </div>
-                                    </div>
-                                    """)
-
-
-        # 🔊 Stap 5: Stem afspelen (indien niet enkel tekstmodus)
-        play_thread = threading.Thread(
+        # 🔊 Spraakuitvoer (indien niet in tekst-only modus)
+        threading.Thread(
             target=spreek_tekst_synchroon,
             args=(vertaling, doel_taal, not enkel_tekst),
-        )
-        play_thread.start()
+        ).start()
 
-        # 🔁 Stap 6: JSON terug naar browser
+        # 🔁 Antwoord naar frontend
         return jsonify({"original": verbeterde_zin, "translation": vertaling})
 
     except Exception as e:
@@ -275,16 +282,13 @@ def vertaal_audio():
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
-
+#-------------------------------------------------------einde document
 @app.route("/resultaat")
 def resultaat():
     return send_from_directory(".", "live_vertaal.html")
 
-with open("live_vertaal.html", "a", encoding="utf-8") as f:
-    f.write("</body></html>")
-
-
 # -------------------- START SERVER --------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
