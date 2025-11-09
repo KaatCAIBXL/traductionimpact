@@ -7,4 +7,6 @@ requests
 edge-tts
 SpeechRecognition
 pygame
+openai-whisper
+
 
